@@ -1,0 +1,215 @@
+name: Build WebService with Version v2
+
+on:
+  workflow_call:
+    inputs:
+      gcp_region:
+        required: true
+        type: string
+      gcp_project_id:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      repository:
+        required: true
+        type: string
+      branch:
+        required: true
+        type: string
+      dockerfile:
+        required: true
+        type: string
+      project_dir:
+        required: true
+        type: string
+      image_repo:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+      secret_name:
+        required: true
+        type: string
+      env_path:
+        required: true
+        type: string
+      git_tag:
+        required: false
+        type: string
+        default: ""
+      git_commit:
+        required: false
+        type: string
+        default: "unknown"
+      build_time:
+        required: false
+        type: string
+        default: ""
+
+    secrets:
+      gcp_workload_identity_provider:
+        required: true
+      gcp_service_account:
+        required: true
+      submodule_ssh_key:
+        required: true
+
+
+jobs:
+  build:
+    name: Pull Repository & Build
+    runs-on: ubuntu-latest
+    environment: 
+      name: ${{ inputs.environment }}
+    # Add "id-token" with the intended permissions.
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set tag
+      id: vars
+      run: echo "tag=${GITHUB_REF#refs/*/}" >> $GITHUB_OUTPUT
+    
+    - name: Debug Version Information
+      run: |
+        echo "=== Version Information Received ==="
+        echo "Git Tag: '${{ inputs.git_tag }}'"
+        echo "Git Commit: '${{ inputs.git_commit }}'"
+        echo "Build Time: '${{ inputs.build_time }}'"
+        echo "Reference Tag: '${GITHUB_REF#refs/*/}'"
+        echo "=================================="
+        
+        # Validate that we have the minimum required info
+        if [ -z "${{ inputs.git_commit }}" ] || [ "${{ inputs.git_commit }}" = "unknown" ]; then
+          echo "⚠️  Warning: Git commit is missing or unknown"
+        fi
+        
+        if [ -z "${{ inputs.build_time }}" ]; then
+          echo "⚠️  Warning: Build time is empty"
+        else
+          echo "✅ Build time provided: ${{ inputs.build_time }}"
+        fi
+        
+        if [ -z "${{ inputs.git_tag }}" ]; then
+          echo "⚠️  No git tag provided (this is normal for non-tag builds)"
+        else
+          echo "✅ Git tag provided: ${{ inputs.git_tag }}"
+        fi
+    
+    - name: Checkout submodules
+      uses: actions/checkout@v3
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.branch }}
+        path: ${{ inputs.project_dir }}
+        ssh-key: ${{ secrets.submodule_ssh_key }}
+        submodules: recursive
+    
+    - id: 'auth'
+      name: 'Authenticate to Google Cloud'
+      uses: 'google-github-actions/auth@v1'
+      with:
+        workload_identity_provider: ${{ secrets.gcp_workload_identity_provider }}
+        service_account: ${{ secrets.gcp_service_account }}
+        token_format: 'access_token'
+
+    - name: Get .env from Secret Manager
+      env:
+        PROJECT_ID: ${{ inputs.gcp_project_id }}
+        SECRET_NAME: ${{ inputs.secret_name }}
+      run: |
+        echo "Fetching .env from Secret Manager..."
+        gcloud secrets versions access latest \
+          --project=$PROJECT_ID \
+          --secret=$SECRET_NAME > ${{ inputs.env_path }}
+        echo "✅ .env file created at ${{ inputs.env_path }}"
+
+    # This example uses the docker login action
+    - uses: 'docker/login-action@v1'
+      name: 'Docker Login'
+      with:
+        registry: ${{ inputs.gcp_region }}-docker.pkg.dev
+        username: oauth2accesstoken
+        password: ${{ steps.auth.outputs.access_token }}
+
+    - name: Prepare Build Arguments
+      id: build-args
+      run: |
+        # Prepare build arguments with proper escaping
+        GIT_TAG="${{ inputs.git_tag }}"
+        GIT_COMMIT="${{ inputs.git_commit }}"
+        BUILD_TIME="${{ inputs.build_time }}"
+        
+        # Set defaults if empty
+        if [ -z "$BUILD_TIME" ]; then
+          BUILD_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Using generated build time: $BUILD_TIME"
+        fi
+        
+        if [ -z "$GIT_COMMIT" ] || [ "$GIT_COMMIT" = "unknown" ]; then
+          GIT_COMMIT="workflow-unknown"
+          echo "Using fallback git commit: $GIT_COMMIT"
+        fi
+        
+        # Output for next step
+        echo "git_tag=$GIT_TAG" >> $GITHUB_OUTPUT
+        echo "git_commit=$GIT_COMMIT" >> $GITHUB_OUTPUT
+        echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
+        
+        echo "=== Final Build Arguments ==="
+        echo "GIT_TAG: '$GIT_TAG'"
+        echo "GIT_COMMIT: '$GIT_COMMIT'"  
+        echo "BUILD_TIME: '$BUILD_TIME'"
+        echo "=========================="
+
+    - name: Build, tag, and push image to Artifacts Registry
+      id: build-image
+      env:
+        TAG_LATEST: ${{ inputs.gcp_region }}-docker.pkg.dev/${{ inputs.gcp_project_id }}/${{ inputs.image_repo }}:${{ inputs.image_tag }}
+        TAG_VERSION: ${{ inputs.gcp_region }}-docker.pkg.dev/${{ inputs.gcp_project_id }}/${{ inputs.image_repo }}:${{ steps.vars.outputs.tag}}
+      run: |
+        echo "=== Starting Docker Build ==="
+        echo "Dockerfile: ${{ inputs.dockerfile }}"
+        echo "Latest Tag: $TAG_LATEST"
+        echo "Version Tag: $TAG_VERSION"
+        
+        # Build with explicit build arguments
+        docker build \
+          -f ${{ inputs.dockerfile }} \
+          -t $TAG_LATEST \
+          -t $TAG_VERSION \
+          --build-arg "GIT_TAG=${{ steps.build-args.outputs.git_tag }}" \
+          --build-arg "GIT_COMMIT=${{ steps.build-args.outputs.git_commit }}" \
+          --build-arg "BUILD_TIME=${{ steps.build-args.outputs.build_time }}" \
+          --progress=plain \
+          .
+        
+        echo "=== Build completed, pushing images ==="
+        docker push $TAG_LATEST
+        docker push $TAG_VERSION
+        
+        echo "image=$TAG_VERSION" >> $GITHUB_OUTPUT
+        echo "✅ Images pushed successfully"
+
+    - name: Verify Build Arguments in Image
+      run: |
+        echo "=== Verifying build arguments were properly set ==="
+        # Run a quick container to check if env vars are set
+        docker run --rm ${{ env.TAG_LATEST }} /bin/bash -c "
+          echo 'Checking environment variables in built image:'
+          echo 'APP_VERSION:' \$APP_VERSION
+          echo 'GIT_COMMIT:' \$GIT_COMMIT  
+          echo 'BUILD_TIME:' \$BUILD_TIME
+          if [ -f /app/set-version-env.sh ]; then
+            echo 'Version script exists:'
+            cat /app/set-version-env.sh
+          else
+            echo 'No version script found'
+          fi
+        " || echo "Could not verify environment variables (this may be normal if the container doesn't have bash)"
+      continue-on-error: true
